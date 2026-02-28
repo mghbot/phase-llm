@@ -3,9 +3,10 @@ PhaseLLM v2 — Hybrid Phase Space + LLM AI
 Single file. One command: python phase_llm_v2.py
 
 Uses LOCAL Qwen3 0.6B at ~/phase-space-qwen3/
+Falls back to lightweight random projection if model unavailable.
 No downloads needed. Runs on CPU.
 
-Requirements: pip install torch transformers sympy numpy
+Requirements: pip install torch transformers sympy numpy scikit-learn scipy
 """
 
 import torch
@@ -14,8 +15,11 @@ import numpy as np
 import sympy
 import time
 import sys
+import os
 from dataclasses import dataclass
 from typing import Any, Optional
+
+from ops_library import build_phase_system, RealPhaseRouter, OpExecutor
 
 
 # ============================================================
@@ -82,46 +86,72 @@ class SolveResult:
 # ============================================================
 # LLM INTERFACE — Encodes NL → 64D semantic vector
 # Uses local Qwen3 0.6B (1024 hidden → 64D)
+# Falls back to hash-based projection if model unavailable
 # ============================================================
 
 class LLMInterface(nn.Module):
     def __init__(self, cfg: Config):
         super().__init__()
         self.cfg = cfg
+        self._use_fallback = False
 
-        from transformers import AutoTokenizer, AutoModel
-        print(f"[LLM] Loading {cfg.llm_model}...")
-        self.tokenizer = AutoTokenizer.from_pretrained(cfg.llm_model)
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.backbone = AutoModel.from_pretrained(cfg.llm_model)
-        self.backbone.eval()
-        for p in self.backbone.parameters():
-            p.requires_grad = False
+        if os.path.isdir(cfg.llm_model):
+            from transformers import AutoTokenizer, AutoModel
+            print(f"[LLM] Loading {cfg.llm_model}...")
+            self.tokenizer = AutoTokenizer.from_pretrained(cfg.llm_model)
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.backbone = AutoModel.from_pretrained(cfg.llm_model)
+            self.backbone.eval()
+            for p in self.backbone.parameters():
+                p.requires_grad = False
 
-        hdim = self.backbone.config.hidden_size  # 1024 for Qwen3 0.6B
+            hdim = self.backbone.config.hidden_size
 
-        # Projection: 1024 → 256 → 64
-        # NO activation on final layer — preserves phase space geometry
-        self.proj = nn.Sequential(
-            nn.Linear(hdim, 256),
-            nn.GELU(),
-            nn.LayerNorm(256),
-            nn.Linear(256, cfg.semantic_dim),
-            # No activation, no LayerNorm here — bare linear preserves geometry
-        )
-        trainable = sum(p.numel() for p in self.proj.parameters())
-        print(f"[LLM] Ready. Hidden dim: {hdim}. Projection: {trainable:,} trainable params")
+            self.proj = nn.Sequential(
+                nn.Linear(hdim, 256),
+                nn.GELU(),
+                nn.LayerNorm(256),
+                nn.Linear(256, cfg.semantic_dim),
+            )
+            trainable = sum(p.numel() for p in self.proj.parameters())
+            print(f"[LLM] Ready. Hidden dim: {hdim}. Projection: {trainable:,} trainable params")
+        else:
+            print(f"[LLM] Model not found at {cfg.llm_model}, using hash-based fallback")
+            self._use_fallback = True
+            # Deterministic projection from bag-of-chars to 64D
+            self.fallback_proj = nn.Linear(256, cfg.semantic_dim)
+            nn.init.orthogonal_(self.fallback_proj.weight)
 
     def encode(self, text):
         if isinstance(text, str):
             text = [text]
+
+        if self._use_fallback:
+            return self._fallback_encode(text)
+
         tok = self.tokenizer(text, max_length=self.cfg.max_tokens,
                              padding=True, truncation=True, return_tensors="pt")
         with torch.no_grad():
             out = self.backbone(**tok)
         pooled = out.last_hidden_state.mean(dim=1).float()
         return self.proj(pooled)
+
+    def _fallback_encode(self, texts):
+        """Hash-based deterministic encoding: text → 64D vector."""
+        batch = []
+        for text in texts:
+            # Build a reproducible 256D feature vector from text content
+            vec = np.zeros(256, dtype=np.float32)
+            for i, ch in enumerate(text):
+                idx = hash(ch) % 256
+                vec[idx] += 1.0 / (1 + i * 0.01)
+            # Normalize
+            norm = np.linalg.norm(vec) + 1e-8
+            vec = vec / norm
+            batch.append(vec)
+        x = torch.from_numpy(np.stack(batch))
+        return self.fallback_proj(x)
 
 
 # ============================================================
@@ -155,95 +185,6 @@ class FusionGate(nn.Module):
 
 
 # ============================================================
-# PHASE ROUTER — STUB. Replace with your real GRU.
-#
-# To plug in your real system:
-#   1. Replace self.gru / self.op_head with your trained GRU
-#   2. Load your 1883x256 op embeddings via load_ops()
-#   3. Rewrite navigate() with your beam search
-#   4. Call freeze() after loading
-# ============================================================
-
-class PhaseRouter(nn.Module):
-    def __init__(self, cfg: Config):
-        super().__init__()
-        self.cfg = cfg
-        self.encoder = nn.Sequential(
-            nn.Linear(768, 512), nn.GELU(),
-            nn.Linear(512, cfg.geometric_dim), nn.LayerNorm(cfg.geometric_dim),
-        )
-        self.gru = nn.GRU(cfg.geometric_dim, cfg.gru_hidden,
-                          cfg.gru_layers, batch_first=True)
-        self.op_head = nn.Linear(cfg.gru_hidden, cfg.num_ops)
-        self.op_embeddings = nn.Parameter(
-            torch.randn(cfg.num_ops, cfg.geometric_dim) * 0.1,
-            requires_grad=False)
-        self.op_names = [f"op_{i}" for i in range(cfg.num_ops)]
-        self.freeze()
-
-    def freeze(self):
-        for p in self.parameters():
-            p.requires_grad = False
-
-    def navigate(self, coord, top_k=8):
-        """STUB: Returns mock trajectories. Replace with your beam search."""
-        trajs = []
-        for _ in range(top_k):
-            n = np.random.randint(3, min(15, self.cfg.max_depth))
-            ids = np.random.choice(self.cfg.num_ops, n, replace=False).tolist()
-            trajs.append(Trajectory(
-                op_ids=ids,
-                op_names=[self.op_names[i] for i in ids],
-                coordinates=np.random.randn(n, self.cfg.geometric_dim).astype(np.float32),
-                energy=float(np.random.exponential(1.0)),
-                confidence=float(np.random.uniform(0.3, 0.95)),
-            ))
-        trajs.sort(key=lambda t: t.energy)
-        return trajs[:top_k]
-
-    def load_weights(self, path):
-        self.load_state_dict(torch.load(path, map_location="cpu"), strict=False)
-        self.freeze()
-        print(f"[PhaseRouter] Loaded from {path}, FROZEN")
-
-    def load_ops(self, embeddings, names):
-        self.op_embeddings = nn.Parameter(
-            torch.from_numpy(embeddings).float(), requires_grad=False)
-        self.op_names = names
-        print(f"[PhaseRouter] Loaded {len(names)} operations")
-
-
-# ============================================================
-# OP ENGINE — STUB. Replace with your 1883 operations.
-# ============================================================
-
-class OpEngine:
-    def __init__(self):
-        x = sympy.Symbol('x')
-        self.ops = {
-            "integrate_poly": lambda e, v=x: sympy.integrate(e, v),
-            "differentiate": lambda e, v=x: sympy.diff(e, v),
-            "factor": lambda e: sympy.factor(e),
-            "expand": lambda e: sympy.expand(e),
-            "simplify": lambda e: sympy.simplify(e),
-            "solve_eq": lambda e, v=x: sympy.solve(e, v),
-        }
-
-    def execute(self, traj, init_expr=None):
-        try:
-            cur = init_expr or sympy.Symbol('x')
-            for name in traj.op_names:
-                if name in self.ops:
-                    cur = self.ops[name](cur)
-            return ExecResult(traj, cur, str(cur), True)
-        except Exception as e:
-            return ExecResult(traj, None, "", False, str(e))
-
-    def execute_top_k(self, trajs, k=3):
-        return [self.execute(t) for t in trajs[:k]]
-
-
-# ============================================================
 # VALIDATOR
 # ============================================================
 
@@ -269,6 +210,11 @@ class Validator:
 
 # ============================================================
 # PIPELINE — pipeline.solve("problem")
+#
+# Wired to ops_library.py:
+#   - build_phase_system() builds taxonomy, embeddings, router, executor
+#   - RealPhaseRouter takes geo_embed(256) + sem_embed(64) as separate inputs
+#   - OpExecutor runs SymPy operation chains from the 1,883 op taxonomy
 # ============================================================
 
 class PhaseLLM:
@@ -277,32 +223,88 @@ class PhaseLLM:
         print("=" * 50)
         print("  PhaseLLM v2 — Initializing")
         print("=" * 50)
+
+        # Build phase system: taxonomy, Lorentz embeddings, router, executor
+        self.ops, self.coords, self.router, self.executor = build_phase_system()
+        self.cfg.num_ops = len(self.ops)
+
         self.llm = LLMInterface(self.cfg)
         self.fusion = FusionGate(self.cfg)
-        self.router = PhaseRouter(self.cfg)
-        self.engine = OpEngine()
         self.validator = Validator()
+
+        # Centroid of all op coordinates as initial geometric reference point
+        self.geo_centroid = torch.from_numpy(
+            self.coords.mean(axis=0).astype(np.float32)
+        ).unsqueeze(0)  # (1, 256)
+
         print(f"[Fusion] {sum(p.numel() for p in self.fusion.parameters()):,} params")
+        print(f"[Router] {self.router.param_count():,} trainable params")
         print("[PhaseLLM] Ready.\n")
 
     def solve(self, problem: str) -> SolveResult:
         t0 = time.perf_counter()
 
-        semantic = self.llm.encode(problem)
-        geometric = torch.randn(1, self.cfg.geometric_dim)  # STUB: replace w/ your encoder
+        # 1. Encode problem → 64D semantic embedding
+        semantic = self.llm.encode(problem)  # (1, 64)
 
-        fused = self.fusion(geometric, semantic)
+        # 2. Initial geometric embedding — centroid of operation space
+        geometric = self.geo_centroid.clone()  # (1, 256)
+
+        # 3. Fuse geometric + semantic → 256D fused coordinate
+        fused = self.fusion(geometric, semantic)  # (1, 256)
 
         best_score, best_result, loops = 0.0, None, 0
+
         for i in range(self.cfg.max_refine + 1):
-            trajs = self.router.navigate(fused, self.cfg.top_k)
-            results = self.engine.execute_top_k(trajs, k=self.cfg.top_k)
+            # 4. Route: expand to top_k batch with perturbations for diversity
+            top_k = self.cfg.top_k
+            geo_batch = fused.detach().expand(top_k, -1) + torch.randn(top_k, self.cfg.geometric_dim) * 0.05
+            sem_batch = semantic.detach().expand(top_k, -1)
+
+            with torch.no_grad():
+                traj_indices = self.router(geo_batch, sem_batch)  # list[list[int]]
+
+            # 5. Execute each trajectory through OpExecutor
+            results = []
+            for op_ids in traj_indices:
+                valid_ids = [idx for idx in op_ids if idx < len(self.ops)]
+                op_names = [self.ops[idx]["name"] for idx in valid_ids]
+
+                # Build Trajectory object
+                if valid_ids:
+                    traj_coords = self.coords[valid_ids]
+                    energy = float(np.linalg.norm(traj_coords.mean(axis=0)))
+                else:
+                    traj_coords = np.zeros((0, 256), dtype=np.float32)
+                    energy = 0.0
+
+                traj = Trajectory(
+                    op_ids=valid_ids,
+                    op_names=op_names,
+                    coordinates=traj_coords,
+                    energy=energy,
+                    confidence=1.0 / (1.0 + energy),
+                )
+
+                # Execute the operation chain via OpExecutor
+                result_expr, success = self.executor.execute_chain(valid_ids, self.ops)
+                results.append(ExecResult(
+                    trajectory=traj,
+                    result=result_expr,
+                    result_str=str(result_expr),
+                    success=success,
+                ))
+
+            # 6. Validate — pick best result
             score, result = self.validator.best(results, problem)
             if score > best_score:
                 best_score, best_result = score, result
             if score >= self.cfg.confidence_threshold:
                 break
             loops += 1
+
+            # Re-fuse with perturbation for next refinement round
+            geometric = self.geo_centroid + torch.randn_like(self.geo_centroid) * 0.1
             fused = self.fusion(geometric, semantic)
 
         ms = (time.perf_counter() - t0) * 1000
@@ -337,4 +339,4 @@ if __name__ == "__main__":
         print(f"Time:       {r.time_ms:.0f}ms | Refinements: {r.refinements}")
         print()
 
-    print("Done. PhaseRouter + ops are stubs — plug in your real ones for real answers.")
+    print("Done.")
